@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mihon Merger v5 (Full Genre Filter + Detailed Debug)</title>
+<style>
+body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:24px;background:#f5f7fa}
+.card{max-width:980px;margin:0 auto;background:#fff;padding:18px;border-radius:12px;box-shadow:0 12px 30px rgba(2,6,23,.08)}
+h1{margin:0 0 6px}p.lead{margin:0 0 14px;color:#556}
+label{font-weight:700;display:block;margin-top:10px}
+.file-drop{border:2px dashed #dbe4f2;border-radius:10px;padding:12px;background:#fff}
+.btn{padding:10px 12px;border-radius:9px;border:0;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;font-weight:700;cursor:pointer;margin-top:12px}
+.btn.secondary{background:linear-gradient(135deg,#10b981,#059669)}
+.alert{padding:10px;border-radius:8px;margin-top:10px;display:none}
+.alert.show{display:block}
+.err{background:#fff6f6;border:1px solid #ffd2d2;color:#900}
+.ok{background:#f0fff6;border:1px solid #c8ffd6;color:#075}
+pre{background:#f7f9fc;padding:10px;border-radius:8px;overflow:auto;max-height:400px}
+footer{margin-top:10px;color:#667}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/protobufjs@7.2.4/dist/protobuf.min.js"></script>
+</head>
+<body>
+<div class="card">
+<h1>🔁 Mihon Merger v5 (Full Genre Filter + Detailed Debug)</h1>
+<p class="lead">Detects and skips genre/category words like "Shounen", "Manhwa", etc. Shows all parsed strings and skipped titles for each entry.</p>
+
+<label>Choose backups (multiple allowed)</label>
+<div class="file-drop">
+  <input type="file" id="files" accept=".tachibk,.proto.gz" multiple />
+</div>
+
+<button class="btn" onclick="analyzeFiles()">Analyze Files</button>
+<button id="mergeBtn" class="btn secondary" style="display:none" onclick="performMerge()">Merge & Download</button>
+
+<div id="error" class="alert err"></div>
+<div id="ok" class="alert ok"></div>
+
+<div id="summary" style="display:none;margin-top:10px">
+<h3>Summary</h3>
+<pre id="summaryText"></pre>
+</div>
+
+<footer>Smart deduplication (url+title) • Extensive genre blacklist • Full debug preview</footer>
+</div>
+
+<script>
+const protoSchema = `syntax = "proto3";
+package tachiyomi;
+message Backup {
+  repeated BackupManga backupManga = 1;
+  repeated BackupCategory backupCategories = 2;
+  repeated BackupSource backupSources = 3;
+}
+message BackupManga {
+  int32 source = 1;
+  string url = 2;
+  string title = 3;
+  string artist = 4;
+  string author = 5;
+  string description = 6;
+  repeated string genre = 7;
+  int32 status = 8;
+  string thumbnailUrl = 9;
+  int64 dateAdded = 10;
+  int32 viewer = 11;
+  int32 viewer_flags = 12;
+  repeated BackupChapter chapters = 13;
+  repeated int32 categories = 14;
+}
+message BackupChapter { string name = 1; int32 source_order = 2; }
+message BackupCategory { string name = 1; int32 order = 2; int32 flags = 3; }
+message BackupSource { string name = 1; string url = 2; }
+`;
+const root = protobuf.parse(protoSchema).root;
+const BackupType = root.lookupType("tachiyomi.Backup");
+
+function showError(m){const e=document.getElementById('error');e.textContent=m;e.classList.add('show');document.getElementById('ok').classList.remove('show');}
+function showOk(m){const e=document.getElementById('ok');e.textContent=m;e.classList.add('show');document.getElementById('error').classList.remove('show');}
+function clearMsgs(){document.getElementById('error').classList.remove('show');document.getElementById('ok').classList.remove('show');}
+
+// complete genre blacklist
+const genreBlacklist = new Set([
+  'action','adventure','adult','comedy','drama','fantasy','romance','horror','thriller','psychological','slice of life','school life','isekai',
+  'ecchi','harem','shounen','shoujo','seinen','josei','sports','supernatural','mystery','sci-fi','science fiction','magic','martial arts',
+  'historical','tragedy','mecha','music','game','idol','military','parody','police','vampire','zombie','yaoi','yuri','bl','gl','doujin',
+  'oneshot','short','gore','violence','crime','smut','adult','gender bender','shota','incest','dementia','demons','kids','family','friendship',
+  'cooking','food','survival','mature','hentai','war','post apocalyptic','villainess','reincarnation','otome','reverse harem','shounen ai','shoujo ai','sports','mystery','webtoon','webtoons','manhwa','manga','comic','comics'
+]);
+
+// Normalize string for comparison
+function normalizeStr(t){
+  return t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();
+}
+
+// Is this string a "bad" (genre-like) candidate for title?
+function isBadTitle(t){
+  const n = normalizeStr(t);
+  if(!n) return true;
+  if(genreBlacklist.has(n)) return true;
+  if(n.length < 3) return true;
+  if(n.split(' ').length < 2 && n.length < 12 && genreBlacklist.has(n.split(' ')[0])) return true;
+  if(/^(shounen|seinen|shoujo|josei|yaoi|yuri|bl|gl|doujin)$/i.test(n)) return true;
+  return false;
+}
+
+// standard Mihon/Tachiyomi decode
+async function tryStandard(file){
+  try{
+    const ab=await file.arrayBuffer();const arr=new Uint8Array(ab);
+    try{
+      const inflated=pako.ungzip(arr);const d=BackupType.decode(inflated);
+      return {ok:true,obj:BackupType.toObject(d,{longs:String,enums:String,bytes:String}),method:'standard'};
+    }catch(e){
+      const d=BackupType.decode(arr);
+      return {ok:true,obj:BackupType.toObject(d,{longs:String,enums:String,bytes:String}),method:'standard-raw'};
+    }
+  }catch(e){return{ok:false,error:e.message||String(e)};}
+}
+
+// tolerant Komikku parser with genre skip + full debug
+async function komikkuDecode(file){
+  const ab=await file.arrayBuffer();const arr=new Uint8Array(ab);
+  let dec;try{dec=pako.ungzip(arr);}catch(e){dec=arr;}
+  function readVar(buf,p){let r=0n,s=0n,i=p;while(i<buf.length){const b=BigInt(buf[i]);r|=(b&0x7fn)<<s;i++;if((b&0x80n)===0n)return{v:Number(r),n:i};s+=7n;if(s>70n)return{v:null,n:i};}return{v:null,n:i};}
+  const items=[];let pos=0;
+  while(pos<dec.length){const k=readVar(dec,pos);if(k.v===null){pos++;continue;}const w=k.v&7,f=k.v>>3;const np=k.n;
+    if(w===2&&f===1){const l=readVar(dec,np);if(l.v===null){pos=np+1;continue;}const s=l.n,e=s+l.v;if(e>dec.length)break;items.push(dec.slice(s,e));pos=e;}
+    else{if(w===0){const v=readVar(dec,np);pos=v.n;}else if(w===1)pos=np+8;else if(w===2){const v=readVar(dec,np);pos=v.n+(v.v||0);}else if(w===5)pos=np+4;else pos=np+1;}
+  }
+
+  function parseSub(b){const out={s:[],v:[]};let p=0;
+    while(p<b.length){const k=readVar(b,p);if(k.v===null)break;const w=k.v&7,f=k.v>>3;const np=k.n;
+      if(w===0){const v=readVar(b,np);out.v.push({f,v:v.v});p=v.n;}
+      else if(w===2){const v=readVar(b,np);if(v.v===null)break;const s=b.slice(v.n,v.n+v.v);
+        try{const t=new TextDecoder().decode(s);out.s.push({f,t});}catch(e){out.s.push({f,t:''});}
+        p=v.n+v.v;
+      }else if(w===1)p=np+8;else if(w===5)p=np+4;else p=np+1;
+    }return out;
+  }
+
+  const entries=[];let debug='';
+  for(const it of items){
+    const p=parseSub(it);
+    const url=(p.s.find(x=>/\/manga\/|\/series\//i.test(x.t))||p.s.find(x=>x.t.startsWith('/'))||{}).t||'';
+    let titles=p.s.map(x=>x.t.trim()).filter(t=>t&&!/\/manga\/|https?:\/\//i.test(t));
+    let chosen='';let skipped=[];
+    for(const t of titles){
+      if(isBadTitle(t)){skipped.push(t);continue;}
+      chosen=t;break;
+    }
+    if(!chosen && titles.length>0) chosen=titles[titles.length-1];
+    const src=p.v.length?p.v[0].v:0;
+    debug+=`Entry:\nStrings: ${titles.join(' | ')}\nSkipped: ${skipped.join(', ')||'none'}\n→ Title="${chosen}" URL="${url}"\n\n`;
+    if(chosen||url)entries.push({title:chosen||url.split('/').pop(),url,source:src});
+  }
+
+  const backup={backupManga:[],backupCategories:[{name:'Imported',order:0,flags:0}],backupSources:[]};
+  let i=0;
+  for(const e of entries){
+    backup.backupManga.push({source:e.source||0,url:e.url||`/import/${i}`,title:e.title||`Imported ${i}`,artist:'',author:'',description:'',genre:[],status:1,thumbnailUrl:'',dateAdded:Date.now(),viewer:0,viewer_flags:0,chapters:[],categories:[]});
+    i++;
+  }
+  return {ok:true,obj:backup,method:'komikku',debug};
+}
+
+async function flexDecode(file){
+  const std=await tryStandard(file);
+  if(std.ok)return{ok:true,obj:std.obj,method:std.method};
+  return await komikkuDecode(file);
+}
+
+let decoded=[];
+async function analyzeFiles(){
+  clearMsgs();decoded=[];document.getElementById('summary').style.display='none';
+  const fs=document.getElementById('files').files;if(!fs.length)return showError('Select at least one .tachibk file.');
+  let total=0;let lines=[];
+  for(const f of fs){
+    showOk('Decoding '+f.name+' ...');
+    const r=await flexDecode(f);
+    if(!r.ok)throw new Error('Failed: '+f.name+' '+(r.error||''));
+    decoded.push({name:f.name,obj:r.obj,method:r.method,debug:r.debug||''});
+    const c=(r.obj.backupManga||[]).length;total+=c;
+    lines.push(`${f.name}: ${c} manga (${r.method})`);
+  }
+  let text=lines.join('\n')+`\n\nTotal loaded: ${total}\n\nFull debug (all parsed strings per entry):\n`;
+  for(const d of decoded){ if(d.debug) text+=`\n--- ${d.name} ---\n`+d.debug+'\n'; }
+  document.getElementById('summaryText').textContent=text;
+  document.getElementById('summary').style.display='block';
+  document.getElementById('mergeBtn').style.display='inline-block';
+  showOk('Files analyzed. Review summary and click "Merge & Download".');
+}
+
+function performMerge(){
+  if(!decoded.length)return showError('No decoded files.');
+  try{
+    const merged={backupManga:[],backupCategories:[{name:'Merged',order:0,flags:0}],backupSources:[]};
+    const seen=new Set();const dups=[];
+    for(const f of decoded){
+      for(const m of (f.obj.backupManga||[])){
+        const key=((m.url||'')+'|'+(m.title||'')).toLowerCase().trim();
+        if(seen.has(key)){dups.push(m.title||'(no title)');continue;}
+        seen.add(key);
+        merged.backupManga.push({...m});
+      }
+    }
+    const err=BackupType.verify(merged);if(err)return showError('Invalid merged data: '+err);
+    const msg=BackupType.create(merged);const buf=BackupType.encode(msg).finish();const gz=pako.gzip(buf);
+    const blob=new Blob([gz],{type:'application/octet-stream'});const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);a.download=`mihon_merged_v5_${Date.now()}.tachibk`;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);
+    const dupSummary=dups.length?`\n\nSkipped ${dups.length} duplicates:\n- `+dups.slice(0,50).join('\n- ')+(dups.length>50?`\n...and ${dups.length-50} more`:''):''; 
+    document.getElementById('summaryText').textContent+=`\n\nMerged total: ${merged.backupManga.length} manga${dupSummary}`;
+    showOk('Merged backup downloaded.');
+  }catch(e){showError(e.message||e);}
+}
+</script>
+</body>
+</html>

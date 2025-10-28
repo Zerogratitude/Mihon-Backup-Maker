@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Manga List → Mihon (Protobuf .tachibk)</title>
+  <meta name="description" content="Convert MyAnimeList / AniList exports into a Mihon/Tachiyomi .tachibk backup (protobuf + gzip)"/>
+  <style>
+    body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:24px;background:#f5f7fa}
+    .card{max-width:900px;margin:0 auto;background:#fff;padding:18px;border-radius:12px;box-shadow:0 12px 30px rgba(2,6,23,.08)}
+    h1{margin:0 0 6px}p.lead{margin:0 0 14px;color:#556}
+    .row{display:flex;gap:8px;margin-bottom:12px}
+    .service-btn{flex:1;padding:10px;border-radius:8px;border:1px solid #e6e9ef;background:#fbfdff;cursor:pointer;font-weight:700}
+    .service-btn.active{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border-color:transparent}
+    label{display:block;margin-bottom:6px;font-weight:700}
+    .file-drop{border:2px dashed #dbe4f2;border-radius:10px;padding:12px;background:#fff}
+    .controls{display:flex;gap:8px;margin-top:12px}
+    .btn{padding:10px 12px;border-radius:9px;border:0;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;font-weight:700;cursor:pointer}
+    .btn.secondary{background:linear-gradient(135deg,#10b981,#059669)}
+    .alert{padding:10px;border-radius:8px;margin-top:10px;display:none}
+    .alert.show{display:block}
+    .err{background:#fff6f6;border:1px solid #ffd2d2;color:#900}
+    .ok{background:#f0fff6;border:1px solid #c8ffd6;color:#075}
+    pre{background:#f7f9fc;padding:10px;border-radius:8px;overflow:auto;max-height:220px}
+    footer{margin-top:10px;color:#667}
+  </style>
+
+  <!-- Libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/protobufjs@7.2.4/dist/protobuf.min.js"></script>
+</head>
+<body>
+  <div class="card">
+    <h1>📚 Manga List → Mihon (real .tachibk)</h1>
+    <p class="lead">Creates a protobuf-encoded, gzipped .tachibk backup compatible with Mihon/Tachiyomi. (Basic: titles + categories)</p>
+
+    <div class="row">
+      <button id="malBtn" class="service-btn active" onclick="selectService('mal')">MyAnimeList</button>
+      <button id="anilistBtn" class="service-btn" onclick="selectService('anilist')">AniList</button>
+      <button id="tachbkBtn" class="service-btn" onclick="selectService('tachbk')">Inspect .tachibk</button>
+    </div>
+
+    <label for="fileInput">Upload export</label>
+    <div class="file-drop">
+      <input id="fileInput" type="file" accept=".xml,.txt,.json,.tachibk,.proto.gz" />
+      <p id="fileInfo" style="color:#556;margin-top:8px">MAL: export XML/TSV. AniList: export JSON. Or upload an existing Mihon .tachibk to inspect it.</p>
+    </div>
+
+    <div class="controls">
+      <button id="convertBtn" class="btn" onclick="convertFile()">Convert / Inspect</button>
+      <button id="downloadDebug" class="btn secondary" onclick="downloadJson()" style="display:none">Download JSON (debug)</button>
+    </div>
+
+    <div id="error" class="alert err" role="alert"></div>
+    <div id="ok" class="alert ok" role="status"></div>
+
+    <div id="downloadSection" style="display:none;margin-top:12px">
+      <button class="btn secondary" onclick="downloadBackup()">⬇️ Download .tachibk (protobuf + gzip)</button>
+      <pre id="preview"></pre>
+    </div>
+
+    <footer>Note: this uses a simplified subset of Tachiyomi's Backup.proto sufficient for basic restores (title, url, source, dateAdded, categories).</footer>
+  </div>
+
+<script>
+// Minimal protobuf schema subset (enough for basic restore)
+const protoSchema = `syntax = "proto3";
+package tachiyomi;
+
+message Backup {
+  repeated BackupManga backupManga = 1;
+  repeated BackupCategory backupCategories = 2;
+  repeated BackupSource backupSources = 3;
+}
+
+message BackupManga {
+  int32 source = 1;
+  string url = 2;
+  string title = 3;
+  string artist = 4;
+  string author = 5;
+  string description = 6;
+  repeated string genre = 7;
+  int32 status = 8;
+  string thumbnailUrl = 9;
+  int64 dateAdded = 10;
+  int32 viewer = 11;
+  int32 viewer_flags = 12;
+  repeated BackupChapter chapters = 13;
+  repeated int32 categories = 14;
+}
+
+message BackupChapter {
+  string name = 1;
+  int32 source_order = 2;
+}
+
+message BackupCategory {
+  string name = 1;
+  int32 order = 2;
+  int32 flags = 3;
+}
+
+message BackupSource {
+  // left intentionally minimal
+}
+`;
+
+// Build protobuf types
+const root = protobuf.parse(protoSchema).root;
+const BackupType = root.lookupType('tachiyomi.Backup');
+
+let currentService = 'mal';
+let backupData = null;
+
+function selectService(s) {
+  currentService = s;
+  document.getElementById('malBtn').classList.toggle('active', s==='mal');
+  document.getElementById('anilistBtn').classList.toggle('active', s==='anilist');
+  document.getElementById('tachbkBtn').classList.toggle('active', s==='tachbk');
+  document.getElementById('downloadSection').style.display = 'none';
+  document.getElementById('error').classList.remove('show');
+  document.getElementById('ok').classList.remove('show');
+  document.getElementById('downloadDebug').style.display = 'none';
+  const fileInput = document.getElementById('fileInput');
+  if (s==='mal') { fileInput.accept = '.xml,.txt'; document.getElementById('fileInfo').textContent = 'MAL: export XML or TSV.'; document.getElementById('convertBtn').textContent = 'Convert to Mihon (.tachibk)'; }
+  else if (s==='anilist') { fileInput.accept = '.json'; document.getElementById('fileInfo').textContent = 'AniList: export JSON.'; document.getElementById('convertBtn').textContent = 'Convert to Mihon (.tachibk)'; }
+  else { fileInput.accept = '.tachibk,.proto.gz'; document.getElementById('fileInfo').textContent = 'Upload existing Mihon/Tachiyomi .tachibk to inspect.'; document.getElementById('convertBtn').textContent = 'Inspect Backup'; }
+  fileInput.value='';
+}
+
+function showError(msg){ const e=document.getElementById('error'); e.textContent=msg; e.classList.add('show'); document.getElementById('ok').classList.remove('show'); }
+function showOk(msg){ const e=document.getElementById('ok'); e.textContent=msg; e.classList.add('show'); document.getElementById('error').classList.remove('show'); }
+
+// Parsers (same robust approach)
+function parseMAL(text){
+  const manga=[];
+  const t=text.trim();
+  if(t.startsWith('<')){
+    try{
+      const xml=new DOMParser().parseFromString(text,'text/xml');
+      if(xml.querySelector('parsererror')) throw 'xml error';
+      const entries=xml.querySelectorAll('manga, entry, item');
+      entries.forEach(entry=>{
+        const title=(entry.querySelector('series_title, manga_title, title, name, series_name')?.textContent || entry.getAttribute('title') || entry.getAttribute('name') || '').trim();
+        const chapters=(entry.querySelector('my_read_chapters, chapters, progress')?.textContent || entry.getAttribute('chapters') || '0').trim();
+        const status=(entry.querySelector('my_status, status')?.textContent || entry.getAttribute('status') || 'Reading').trim();
+        if(title) manga.push({title,chapters,status});
+      });
+      if(manga.length) return manga;
+    }catch(e){console.warn('XML fallback',e);}
+  }
+  // TSV/CSV fallback
+  const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  if(lines.length>0){
+    const delim = lines[0].includes('\\t') ? '\\t' : (lines[0].includes(',')?',' : null);
+    let start=0;
+    if(/title/i.test(lines[0])||/name/i.test(lines[0])) start=1;
+    if(delim){
+      for(let i=start;i<lines.length;i++){
+        const parts=lines[i].split(delim).map(s=>s.trim());
+        const title=parts[1]||parts[0]||'';
+        const chapters=parts[2]||'0';
+        const status=parts[4]||'Reading';
+        if(title) manga.push({title,chapters,status});
+      }
+    } else {
+      lines.forEach(l=>manga.push({title:l,chapters:'0',status:'Reading'}));
+    }
+  }
+  return manga;
+}
+
+function parseAniList(obj){
+  const manga=[];
+  const lists = obj?.data?.MediaListCollection?.lists || obj?.lists || obj?.mediaLists || [];
+  if(Array.isArray(lists) && lists.length){
+    lists.forEach(list=>{
+      const entries = list.entries || list?.mediaListEntries || [];
+      entries.forEach(e=>{
+        const media = e.media || e;
+        const title = (media?.title?.romaji || media?.title?.english || media?.title?.native || e?.title || 'Unknown').trim();
+        const chapters = (e?.progress != null ? String(e.progress) : (e?.chapters != null ? String(e.chapters) : '0'));
+        const status = list.name || e?.status || 'Reading';
+        if(title) manga.push({title,chapters,status});
+      });
+    });
+  } else {
+    const entries = Array.isArray(obj) ? obj : obj?.entries || [];
+    entries.forEach(e=>{
+      const title = (e.media?.title?.romaji || e.media?.title?.english || e.title || 'Unknown');
+      const chapters = e.progress || '0';
+      const status = e.status || 'Reading';
+      if(title) manga.push({title,chapters:String(chapters),status});
+    });
+  }
+  return manga;
+}
+
+// generate minimal Backup payload matching proto
+function generateBackup(mangaList){
+  const dateNow = Date.now();
+  const backupManga = mangaList.map((m,idx)=> ({
+    source: 0,
+    url: `/manga/imported/${idx}`,
+    title: m.title,
+    artist: '',
+    author: '',
+    description: `Imported from ${currentService.toUpperCase()}`,
+    genre: [],
+    status: 1,
+    thumbnailUrl: '',
+    dateAdded: dateNow,
+    viewer: 0,
+    viewer_flags: 0,
+    chapters: [],
+    categories: [] // indices referencing backupCategories (we'll leave empty)
+  }));
+  const backupCategories = [{ name: currentService.toUpperCase(), order: 0, flags: 0 }];
+  return { backupManga, backupCategories, backupSources: [] };
+}
+
+// inspect existing .tachibk (gzip -> protobuf decode to JSON if possible)
+async function inspectTachibk(file){
+  const ab = await file.arrayBuffer();
+  const arr = new Uint8Array(ab);
+  try {
+    // first try ungzip
+    const inflated = pako.ungzip(arr);
+    // decode protobuf
+    const decoded = BackupType.decode(inflated);
+    const obj = BackupType.toObject(decoded, { longs: String, enums: String, bytes: String });
+    return { ok:true, obj };
+  } catch(e){
+    // maybe file is plain JSON text or gzipped JSON; try to ungzip to string then JSON parse
+    try {
+      const maybeText = new TextDecoder().decode(pako.ungzip(arr));
+      return { ok:true, obj: JSON.parse(maybeText) };
+    } catch(err){
+      try {
+        const text = new TextDecoder().decode(arr);
+        return { ok:true, obj: JSON.parse(text) };
+      } catch(er){
+        return { ok:false, error: 'Failed to decode .tachibk (not protobuf+gzip or corrupted).' };
+      }
+    }
+  }
+}
+
+async function convertFile(){
+  document.getElementById('downloadSection').style.display='none';
+  document.getElementById('error').classList.remove('show');
+  document.getElementById('ok').classList.remove('show');
+  document.getElementById('downloadDebug').style.display='none';
+
+  const f = document.getElementById('fileInput').files[0];
+  if(!f) return showError('Please select a file.');
+
+  try{
+    if(currentService === 'tachbk'){
+      const res = await inspectTachibk(f);
+      if(!res.ok) throw new Error(res.error || 'Could not inspect backup');
+      backupData = res.obj;
+      showOk('✅ Parsed existing .tachibk backup (showing preview).');
+      document.getElementById('preview').textContent = JSON.stringify(backupData, null, 2).slice(0, 2000);
+      document.getElementById('downloadSection').style.display='block';
+      document.getElementById('downloadDebug').style.display='inline-block';
+      return;
+    }
+
+    const text = await f.text();
+    let mangaList = [];
+    if(currentService === 'mal') mangaList = parseMAL(text);
+    else if(currentService === 'anilist') {
+      let obj;
+      try{ obj = JSON.parse(text); } catch(e){ throw new Error('AniList file is not valid JSON'); }
+      mangaList = parseAniList(obj);
+    }
+
+    if(!mangaList.length) throw new Error('No manga entries found in file.');
+
+    backupData = generateBackup(mangaList);
+
+    // Create protobuf message and encode to binary
+    const err = BackupType.verify(backupData);
+    if(err) throw new Error('Backup structure invalid for protobuf: ' + err);
+    const message = BackupType.create(backupData);
+    const buffer = BackupType.encode(message).finish(); // Uint8Array
+
+    // gzip the protobuf binary
+    const gz = pako.gzip(buffer);
+
+    // store compressed for download
+    backupData.__internal_compressed = gz; // keep for download
+    showOk(`✅ Converted ${mangaList.length} entries — ready to download as .tachibk`);
+    document.getElementById('preview').textContent = JSON.stringify(backupData, null, 2).slice(0, 2000);
+    document.getElementById('downloadSection').style.display='block';
+    document.getElementById('downloadDebug').style.display='inline-block';
+  } catch(e){
+    showError('Error: ' + (e.message || e));
+  }
+}
+
+function downloadJson(){
+  if(!backupData) return showError('Nothing to download');
+  const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `mihon_backup_${Date.now()}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+function downloadBackup(){
+  if(!backupData || !backupData.__internal_compressed) return showError('No compressed backup available. Convert first.');
+  const arr = backupData.__internal_compressed;
+  const blob = new Blob([arr], { type: 'application/octet-stream' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `mihon_backup_${Date.now()}.tachibk`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(a.href);
+  showOk('Download started. Import the .tachibk into Mihon (Restore Backup).');
+}
+
+// Init
+selectService('mal');
+</script>
+</body>
+</html>
