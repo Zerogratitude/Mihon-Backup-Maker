@@ -8,3 +8,6 @@ If you use those just import to mihon and export a new save.
 
 Merger is exactly as it says. Take 2 MIHON saves and merge them.
 The converter makes a mihon save so it will work with merger as well.
+
+
+This was made by ai. Why becuase im fucin stupid thats why.
